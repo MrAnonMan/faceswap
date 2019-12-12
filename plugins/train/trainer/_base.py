@@ -251,8 +251,8 @@ class TrainerBase():
         if not is_colab:
             print(output, end='\r')
         else:
-            # Colab doesn't output unless we spam it to each line
-             print(output)
+            # Colab doesn't output with carriage return at the end, so format differently
+            print("\r{}".format(output), end="")
 
     def train_one_step(self, viewer, timelapse_kwargs, is_colab):
         """ Running training on a batch of images for each side.
