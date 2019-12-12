@@ -251,8 +251,8 @@ class TrainerBase():
         if not is_colab:
             print(output, end='\r')
         else:
-            # Colab doesn't output unless we spam it into the log
-            logger.info(output)
+            # Colab doesn't output unless we spam it to each line
+             print(output)
 
     def train_one_step(self, viewer, timelapse_kwargs, is_colab):
         """ Running training on a batch of images for each side.
