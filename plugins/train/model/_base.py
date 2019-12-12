@@ -461,9 +461,18 @@ class ModelBase():
             logger.info("Loaded model from disk: '%s'", self.model_dir)
         return is_loaded
 
-    def save_models(self):
-        """ Backup and save the models """
+    def save_models(self, is_colab=False):
+        """ Backup and save the models
+        
+        Parameters
+        ----------
+        is_colab: bool, optional
+            `````True`` if Faceswap is running in Google Colab otherwise ``False``
+        """
         logger.debug("Backing up and saving models")
+        if is_colab:
+            # Insert a line break prior to outputting anything to keep Colab's console cleab
+            print("\n")
         save_averages = self.get_save_averages()
         backup_func = self.backup.backup_model if self.should_backup(save_averages) else None
         if backup_func:
