@@ -215,7 +215,7 @@ class Train():
         except KeyboardInterrupt:
             try:
                 logger.debug("Keyboard Interrupt Caught. Saving Weights and exiting")
-                model.save_models(is_colab=self._args.is_colab)
+                model.save_models(is_colab=self._args.colab)
                 trainer.clear_tensorboard()
             except KeyboardInterrupt:
                 logger.info("Saving model weights has been cancelled!")
@@ -307,16 +307,16 @@ class Train():
             if save_iteration:
                 logger.trace("Save Iteration: (iteration: %s", iteration)
                 if self._args.pingpong:
-                    model.save_models(is_colab=self._args.is_colab)
+                    model.save_models(is_colab=self._args.colab)
                     trainer.pingpong.switch()
                 else:
-                    model.save_models(is_colab=self._args.is_colab)
+                    model.save_models(is_colab=self._args.colab)
             elif self._save_now:
                 logger.trace("Save Requested: (iteration: %s", iteration)
-                model.save_models(is_colab=self._args.is_colab)
+                model.save_models(is_colab=self._args.colab)
                 self._save_now = False
         logger.debug("Training cycle complete")
-        model.save_models(is_colab=self._args.is_colab)
+        model.save_models(is_colab=self._args.colab)
         trainer.clear_tensorboard()
         self._stop = True
 
