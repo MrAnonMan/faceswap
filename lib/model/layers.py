@@ -6,10 +6,12 @@ from __future__ import absolute_import
 import sys
 import inspect
 
+import numpy as np
 import tensorflow as tf
 import keras.backend as K
 
-from keras.layers import InputSpec, Layer
+from keras.initializers import RandomNormal
+from keras.layers import Dense, InputSpec, Layer
 from keras.utils import get_custom_objects
 
 from lib.utils import get_backend
@@ -184,10 +186,8 @@ class PixelShuffler(Layer):
         dict
             A python dictionary containing the layer configuration
         """
-        config = {'size': self.size,
-                  'data_format': self.data_format}
-        base_config = super(PixelShuffler, self).get_config()
-
+        config = dict(size=self.size, data_format=self.data_format)
+        base_config = super().get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 
@@ -379,9 +379,8 @@ class SubPixelUpscaling(Layer):
         dict
             A python dictionary containing the layer configuration
         """
-        config = {"scale_factor": self.scale_factor,
-                  "data_format": self.data_format}
-        base_config = super(SubPixelUpscaling, self).get_config()
+        config = dict(scale_factor=self.scale_factor, data_format=self.data_format)
+        base_config = super().get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 
@@ -511,9 +510,8 @@ class ReflectionPadding2D(Layer):
         dict
             A python dictionary containing the layer configuration
         """
-        config = {'stride': self.stride,
-                  'kernel_size': self.kernel_size}
-        base_config = super(ReflectionPadding2D, self).get_config()
+        config = dict(stride=self.stride, kernel_size=self.kernel_size)
+        base_config = super().get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 
@@ -556,8 +554,8 @@ class _GlobalPooling2D(Layer):
 
     def get_config(self):
         """ Set the Keras config """
-        config = {'data_format': self.data_format}
-        base_config = super(_GlobalPooling2D, self).get_config()
+        config = dict(data_format=self.data_format)
+        base_config = super().get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 
@@ -657,9 +655,115 @@ class L2_normalize(Layer):  # pylint:disable=invalid-name
         dict
             A python dictionary containing the layer configuration
         """
-        config = super(L2_normalize, self).get_config()
+        config = super().get_config()
         config["axis"] = self.axis
         return config
+
+
+class DenseNorm(Layer):
+    """ Dense Normalization Layer from DFL """
+    def __init__(self, epsilon=1e-06, dtype="float32", **kwargs):
+        self.epsilon = K.constant(epsilon, dtype=dtype, name="epsilon")
+        self.reciprocal = K.constant(1., dtype=dtype, name="reciprocal")
+        super().__init__(**kwargs)
+
+    def call(self, inputs, **kwargs):  # pylint:disable=unused-argument
+        """This is where the layer's logic lives.
+
+        Parameters
+        ----------
+        inputs: tensor
+            Input tensor, or list/tuple of input tensors
+        kwargs: dict
+            Additional keyword arguments. Unused
+
+        Returns
+        -------
+        tensor
+            A tensor or list/tuple of tensors
+        """
+        var_x = K.mean(K.square(inputs), axis=-1, keepdims=True) + self.epsilon
+        var_x = self.reciprocal - K.sqrt(var_x)
+        var_x = inputs * var_x
+        return var_x
+
+    def get_config(self):
+        """Returns the config of the layer.
+
+        Returns
+        --------
+        dict
+            A python dictionary containing the layer configuration
+        """
+        config = dict(epsilon=self.epsilon, reciprocal=self.reciprocal)
+        base_config = super().get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+class DenseMaxout(Dense):
+    """ Regular densely-connected layer with support for max-out activation and weight
+    scaling.
+
+    See :class:`keras.layers.Dense` for standard input parameters. The following additional
+    parameters can be defined.
+
+    Parameters
+    ----------
+    use_wscale: bool, optional
+        ``True`` to enables weight scaling (equalized learning rate) otherwise ``False``.
+        NB: If :attr:`use_wscale` is ``True`` and a kernel initializer is not provided, then Random
+        Normal initializer will be used. Default: ``False``
+    maxout_channel: int, optional
+        The channel to apply max-out activation to. Must be an integer between 2 and 4, or 0
+        to disable max-out activation. Default=`0`
+    """
+    def __init__(self, units, use_wscale=False, maxout_channel=0, **kwargs):
+        assert maxout_channel == 0 or 2 <= maxout_channel <= 4
+        if maxout_channel != 0:
+            units = units * maxout_channel
+        if use_wscale and kwargs.get("kernel_initializer", None):
+            kwargs["kernel_initializer"] = RandomNormal(0, 1.0)
+        super().__init__(units, **kwargs)
+
+        self.use_weight_scale = use_wscale
+        self.maxout_channel = maxout_channel
+        self.weight_scale = None
+
+    def build(self, input_shape):
+        if self.use_weight_scale:
+            fan_in = np.prod((input_shape[-1], self.units)[:-1])
+            he_std = 1.0 / np.sqrt(fan_in)
+            self.weight_scale = K.constant(he_std, dtype=self.dtype)
+        super().build(input_shape)
+
+    def call(self, inputs):
+        weight = self.kernel * self.weight_scale if self.use_weight_scale else self.kernel
+        output = K.dot(inputs, weight)
+
+        if self.maxout_channel > 1:
+            output = K.reshape(output, (self.units, self.maxout_channel))
+            output = K.max(output, axis=-1)
+
+        if self.use_bias:
+            output = K.bias_add(output, self.bias, data_format="channels_last")
+        if self.activation is not None:
+            output = self.activation(output)
+
+        return output
+
+    def get_config(self):
+        """Returns the config of the layer.
+
+        Returns
+        --------
+        dict
+            A python dictionary containing the layer configuration
+        """
+        config = dict(use_weight_scale=self.use_weight_scale,
+                      maxout_channel=self.maxout_channel,
+                      weight_scale=self.weight_scale)
+        base_config = super().get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
 
 # Update layers into Keras custom objects

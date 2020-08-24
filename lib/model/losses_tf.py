@@ -9,7 +9,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras.engine import compile_utils
 
-from keras import backend as K
+from tensorflow.keras import backend as K
 
 logger = logging.getLogger(__name__)  # pylint:disable=invalid-name
 
@@ -623,3 +623,123 @@ class LossWrapper(tf.keras.losses.Loss):
             loss += func(y_true, y_pred) * weight
         weighted_average = loss / sum(self._loss_weights)
         return weighted_average
+
+
+class DSSIMDFL(tf.keras.losses.Loss):
+    """ DSSIM Loss Function
+
+    Difference of Structural Similarity (DSSIM loss function). Clipped between 0 and 0.5
+
+    Parameters
+    ----------
+    k_1: float, optional
+        Parameter of the SSIM. Default: `0.01`
+    k_2: float, optional
+        Parameter of the SSIM. Default: `0.03`
+    kernel_size: int, optional
+        Size of the sliding window Default: `3`
+    max_value: float, optional
+        Max value of the output. Default: `1.0`
+    """
+    def __init__(self, filter_size=11, filter_sigma=1.5, k_1=0.01, k_2=0.03, max_value=1.0):
+        super().__init__(name="DSSIMObjective")
+        self.filter_size = max(1, filter_size)
+        self.kernel = self._get_kernel(filter_sigma)
+        self.k_1 = k_1
+        self.k_2 = k_2
+        self.max_value = max_value
+        self.dim_ordering = K.image_data_format()
+        self.c_1 = (self.k_1 * self.max_value) ** 2
+        self.c_2 = (self.k_2 * self.max_value) ** 2
+
+    def _get_kernel(self, filter_sigma):
+        """ Create the kernel constant.
+
+        Returns
+        -------
+        :class:`keras.backend.constant`
+            The kernel as a Keras Constant
+        """
+        kernel = np.arange(0, self.filter_size, dtype="float32")
+        kernel -= (self.filter_size - 1) / 2.0
+        kernel = kernel**2
+        kernel *= (-0.5 / (filter_sigma**2))
+        kernel = np.reshape(kernel, (1, -1)) + np.reshape(kernel, (-1, 1))
+        return K.constant(np.reshape(kernel, (1, -1)), dtype="float32")
+
+    @classmethod
+    def _int_shape(cls, input_tensor):
+        """ Returns the shape of tensor or variable as a tuple of int or None entries.
+
+        Parameters
+        ----------
+        input_tensor: tensor or variable
+            The input to return the shape for
+
+        Returns
+        -------
+        tuple
+            A tuple of integers (or None entries)
+        """
+        return K.int_shape(input_tensor)
+
+    def call(self, y_true, y_pred):
+        """ Call the DSSIM Loss Function.
+
+        Parameters
+        ----------
+        y_true: tensor or variable
+            The ground truth value
+        y_pred: tensor or variable
+            The predicted value
+
+        Returns
+        -------
+        tensor
+            The DSSIM Loss value
+        """
+        kernel = K.softmax(self.kernel)
+        kernel = K.reshape(kernel, (self.filter_size, self.filter_size, 1, 1))
+        kernel = K.tile(kernel, (1, 1, self._int_shape(y_pred)[-1], 1))
+
+        mean_true = K.depthwise_conv2d(y_true, kernel)
+        mean_pred = K.depthwise_conv2d(y_pred, kernel)
+        num_0 = mean_true * mean_pred * 2.0
+        denom_0 = K.square(mean_true) + K.square(mean_pred)
+        luminance = (num_0 + self.c_1) / (denom_0 + self.c_1)
+
+        num_1 = K.depthwise_conv2d(y_true * y_pred, kernel) * 2.0
+        denom_1 = K.depthwise_conv2d(K.square(y_true) + K.square(y_pred),
+                                     kernel,
+                                     dilation_rate=None)
+        c_2 = self.c_2 * 1.0  # compensation factor
+        c_s = (num_1 - num_0 + c_2) / (denom_1 - denom_0 + c_2)
+
+        ssim = K.mean(luminance * c_s, axis=[1, 2])
+        dssim = (1.0 - ssim) / 2.0
+        return dssim
+
+
+class DFLLossChain():
+    """ Nonsense """
+    def __init__(self, learn_mask=False, prioritize_eyes=False):
+        self.dssim = compile_utils.LossesContainer(DSSIMDFL())
+        self._learn_mask = learn_mask
+        self._prioritize_eyes = prioritize_eyes
+
+    def __call__(self, y_true, y_pred):
+        # TODO Res changes
+        if self._learn_mask:
+            masks = K.expand_dims(y_true[..., -1], axis=-1)
+            y_true = y_true[..., :-1]
+
+        loss = 10 * self.dssim(y_true, y_pred)
+        loss += 10 * K.square(y_true - y_pred)
+
+        if self._prioritize_eyes:
+            # TODO Add in the eye prioritization area
+            # A_loss += 300*tf.abs ( target_A*target_Am_eyes - pred_A_A*target_Am_eyes )
+            pass
+
+        # if self._learn_mask:
+            # loss += 10 * K.square(masks - pred_A_Am)
