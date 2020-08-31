@@ -68,7 +68,7 @@ class TrainerBase():
         from the default :file:`.config.train.ini` file.
     """
 
-    def __init__(self, model, images, batch_size, configfile):
+    def __init__(self, model, images, batch_size, configfile, feeder=None):
         logger.debug("Initializing %s: (model: '%s', batch_size: %s)",
                      self.__class__.__name__, model, batch_size)
         self._config = _get_config(".".join(self.__module__.split(".")[-2:]),
@@ -78,11 +78,12 @@ class TrainerBase():
         self._images = images
         self._sides = sorted(key for key in self._images.keys())
 
-        self._feeder = _Feeder(images,
-                               self._model,
-                               batch_size,
-                               self._config,
-                               self._get_alignments_data())
+        feeder = _Feeder if feeder is None else feeder
+        self._feeder = feeder(images,
+                              self._model,
+                              batch_size,
+                              self._config,
+                              self._get_alignments_data())
 
         self._tensorboard = self._set_tensorboard()
         self._samples = _Samples(self._model,
@@ -206,7 +207,7 @@ class TrainerBase():
 
         model_inputs, model_targets = self._feeder.get_batch()
         try:
-            loss = self._model.model.train_on_batch(model_inputs, y=model_targets)
+            loss = self.training_loop(model_inputs, model_targets)
         except tf_errors.ResourceExhaustedError as err:
             msg = ("You do not have enough GPU memory available to train the selected model at "
                    "the selected settings. You can try a number of things:"
@@ -252,6 +253,24 @@ class TrainerBase():
 
         if do_timelapse:
             self._timelapse.output_timelapse(timelapse_kwargs)
+
+    def training_loop(self, model_inputs, model_targets):  # pylint:disable=unused-argument, no-self-use
+        """ Run the model's code to train a batch.
+
+        Override for trainer specific Trainer Loop.
+
+        Parameters
+        ----------
+        model_inputs: list
+            List of input tensors to the model
+        model_targets: list
+            List of target tensors for the model
+
+        Returns
+        loss: list
+            The loss values for a batch
+        """
+        return NotImplementedError
 
     def _log_tensorboard(self, loss):
         """ Log current loss to Tensorboard log files

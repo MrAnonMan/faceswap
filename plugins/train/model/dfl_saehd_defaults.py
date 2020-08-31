@@ -93,6 +93,30 @@ _DEFAULTS = dict(
         min_max=(0, 100),
         group="architecture",
         fixed=True),
+    face_style_power=dict(
+        default=0.0,
+        info="Attempt to learn colouring from the original face to apply to the swapped face.\n"
+             "NB: Do not enable this option until you are at least 10,000 iterations in, and "
+             "the faces look recognizable. Start with a low value (like 0.001) and adjust while "
+             "checking progress.\n"
+             "Warning: Enabling this option increases the chance of model collapse.",
+        datatype=float,
+        rounding=3,
+        min_max=(0.0, 100.0),
+        group="loss",
+        fixed=False),
+    bg_style_power=dict(
+        default=0,
+        info="Attempt to apply the area outside of the mask from the original face to the swapped "
+             "face.\n"
+             "This attempts to make the final face more like the swapped face.\n"
+             "Warning: Enabling this option increases the chance of model collapse. A typical "
+             "value is 2",
+        datatype=int,
+        rounding=2,
+        min_max=(0, 100),
+        group="loss",
+        fixed=False),
     res_double=dict(
         default=False,
         info="(Experimental). Double the resolution using the same computational cost. This is "

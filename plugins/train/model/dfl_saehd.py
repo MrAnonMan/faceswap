@@ -6,12 +6,15 @@ from math import ceil
 
 import numpy as np
 
-from keras import backend as K
-from keras.layers import Conv2DTranspose, Dense, Flatten, Input, LeakyReLU, Layer, Reshape, UpSampling2D
+import keras
 
-from lib.model.layers import DenseNorm, DenseMaxout
-from lib.model.nn_blocks import Concatenate, Conv2D, Conv2DBlock, Conv2DOutput, UpscaleBlock, ResidualBlock
-from ._base import ModelBase, KerasModel, _Loss, losses
+from keras import backend as K
+from keras.layers import Conv2DTranspose, Dense, Flatten, Input, LeakyReLU, Reshape, UpSampling2D
+
+from lib.model.layers import DenseNorm
+from lib.model.nn_blocks import (Concatenate, Conv2D, Conv2DBlock, Conv2DOutput, UpscaleBlock,
+                                 ResidualBlock)
+from ._base import ModelBase, KerasModel, losses, logger, k_losses
 
 
 # TODO Add note to use RMS Prop for stock settings
@@ -19,6 +22,9 @@ from ._base import ModelBase, KerasModel, _Loss, losses
 # TODO Conv2D Transpose to NNBlocks
 # TODO Something weird in original implementation around res doubler.
 # resolution moved from res // 16 * 16 to res // 32 * 32
+# TODO Split resolution DSSIM
+# TODO LIAE Inters look wrong
+# TODO Res changes on dssim
 
 class Model(ModelBase):
     """ SAE Model from DFL """
@@ -26,11 +32,17 @@ class Model(ModelBase):
         super().__init__(*args, **kwargs)
         input_size = self._round_up(self.config["input_size"], factor=16)
         self.input_shape = (input_size, input_size, 3)
+        self.trainer = "dfl_sae"
+
         self._architecture = self.config["architecture"].lower()
         self._ae_dims = self._get_ae_dims()
         self._encoder_dims = self._round_up(self.config["encoder_dims"])
         self._decoder_dims = self._round_up(self.config["decoder_dims"])
         self._use_mask = self.config.get("learn_mask", False)
+
+        self._inputs = dict()
+        self._outputs = dict()
+        self._full_model = None
 
     @property
     def _true_face_power(self):
@@ -68,63 +80,58 @@ class Model(ModelBase):
 
     def build_model(self, inputs):
         """ Build the DFL-SAEHD Model """
+        self._inputs["face"] = inputs
         outputs = getattr(self, "_build_{}".format(self._architecture))(inputs)
+        output_shape = K.int_shape(outputs[0])[1:]
 
-        if self._gan_power != 0.0:
-            # TODO What to do with this schiz
-            gan = UNetPatchDiscriminator(K.int_shape(outputs[0])[1:])()
-            print(gan.summary())
+        self._inputs["gan"] = Input(shape=output_shape, name="gan_discrim")
+        inputs.append(self._inputs["gan"])
+
+        gan = UNetPatchDiscriminator(output_shape).build()
+        gan_gen = gan(outputs[0])
+        gan_dis = gan(self._inputs["gan"])
+
+        self._outputs["gan"] = [gan_gen, gan_dis]
+        outputs.extend(self._outputs["gan"])
 
         autoencoder = KerasModel(inputs,
                                  outputs,
                                  name="{}_{}".format(self.name, self._architecture))
-        print(autoencoder.summary())
-        exit(0)
+        return autoencoder
 
     def _build_df(self, inputs):
         encoder = self.encoder()
-        print(encoder.summary())
         inter = self.inter(encoder.output_shape[1:])
-        print(inter.summary())
 
         inter_out_shape = inter.output_shape[1:]
         decoder_a = self.decoder(inter_out_shape, side="a")
-        print(decoder_a.summary())
         decoder_b = self.decoder(inter_out_shape, side="b")
-        print(decoder_b.summary())
-
 
         encoder_a = encoder(inputs[0])
         encoder_b = encoder(inputs[1])
         inter_a = inter(encoder_a)
         inter_b = inter(encoder_b)
+        self._outputs["face"] = [decoder_a(inter_a), decoder_b(inter_b)]
+        self._outputs["swapped"] = decoder_b(inter_a)
+        self._outputs["true_face"] = self.discriminator_df(inter_out_shape)
 
-        if self._true_face_power != 0.0:
-            # TODO Work out what to do with this schizz
-            discriminator = self.discriminator_df(inter_out_shape)
-            print(discriminator.summary())
-            discriminator_a = discriminator(inter_a)
-            discriminator_b = discriminator(inter_b)
-
-        outputs = [decoder_a(inter_a), decoder_b(inter_b)]
+        outputs = [self._outputs["face"][0],
+                   self._outputs["face"][1],
+                   self._outputs["swapped"],
+                   self._outputs["true_face"](inter_a),
+                   self._outputs["true_face"](inter_b)]
         return outputs
-
 
     def _build_liae(self, inputs):
         encoder = self.encoder()
-        print(encoder.summary())
 
         inter_ab = self.inter(encoder.output_shape[1:], side="ab")
-        print(inter_ab.summary())
         inter_b = self.inter(encoder.output_shape[1:], side="b")
-        print(inter_b.summary())
 
         # TODO
-        #inter_out_shapes = (np.array(inter_ab.output_shape[1:]) + np.array(inter_b.output_shape[1:])).tolist()
+        # inter_out_shapes = (np.array(inter_ab.output_shape[1:]) + np.array(inter_b.output_shape[1:])).tolist()
         inter_out_shape = (np.array(inter_ab.output_shape[1:]) * (1, 1, 2)).tolist()
-        print(inter_out_shape)
         decoder = self.decoder(inter_out_shape)
-        print(decoder.summary())
 
         encoder_a = encoder(inputs[0])
         encoder_b = encoder(inputs[1])
@@ -132,8 +139,84 @@ class Model(ModelBase):
         inter_a = Concatenate()([inter_ab(encoder_a), inter_ab(encoder_a)])
         inter_b = Concatenate()([inter_b(encoder_b), inter_ab(encoder_b)])
 
-        outputs = [decoder(inter_a), decoder(inter_b)]
+        inter_swap = Concatenate()[inter_ab(encoder_b), inter_ab(encoder_b)]
+        swap_model = decoder(inter_swap)(encoder_a)
+
+        outputs = [decoder(inter_a), decoder(inter_b), swap_model]
         return outputs
+
+    def _configure_options(self):
+        """ Override to add additional losses as requested.
+
+        Configure the options for the Optimizer and Loss Functions.
+
+        Returns the request optimizer, and sets the loss parameters in :attr:`_loss`.
+
+        Returns
+        :class:`keras.optimizers.Optimizer`
+            The request optimizer
+        """
+        self._full_model = self._model
+        self._set_training_model()
+        optimizer = super()._configure_options()
+        self._loss.__init__()
+        # TODO Calc filter
+        base_loss_model = KerasModel(self._model.inputs[:2],
+                                     self._model.outputs[:2],
+                                     name="base_model")
+        self._loss.configure(base_loss_model)
+        self._set_additional_loss()
+        # TODO Mask channel
+
+        return optimizer
+
+    def _set_training_model(self):
+        """ Collate a version of the full model only containing those required inputs and outputs
+        for the selected user options """
+        inputs = [inp for inp, name in zip(self._model.input, self._model.input_names)
+                  if name != "gan_discrim" or (name == "gan_discrim" and self._gan_power > 0.0)]
+        logger.debug("Training inputs: %s", inputs)
+
+        outputs = [lyr for lyr, name in zip(self._model.output, self._model.output_names)
+                   if name.startswith("decoder")
+                   or (name.startswith("discriminator_df") and self._true_face_power > 0.0)
+                   or (name.startswith("patch_discriminator") and self._gan_power > 0.0)]
+        if self.config["face_style_power"] == 0.0 and self.config["bg_style_power"] == 0.0:
+            # TODO Remove the last decoder output as this is the swap model output. Need to
+            # check counts with learn mask attribute
+            outputs.pop(2)
+
+        logger.debug("Training outputs: %s", outputs)
+        self._model = KerasModel(inputs, outputs, name="{}_training".format(self.name))
+
+    def _set_additional_loss(self):
+        """ Set the additional loss functions for extra outputs """
+        # TODO
+        # print(self._loss.functions)
+        # print(self._model.output_names)
+        if self.config["face_style_power"] > 0.0 or self.config["bg_style_power"] > 0.0:
+            swap_loss = losses.LossWrapper()
+            mask_channel = 3
+            if self.config["face_style_power"] > 0.0:
+                swap_loss.add_loss(StyleLoss(loss_weight=self.config["face_style_power"] * 100.0),
+                                   mask_channel=mask_channel)
+                mask_channel += 1
+            if self.config["bg_style_power"] > 0.0:
+                swap_loss.add_loss(self._loss.loss_function,
+                                   weight=self.config["bg_style_power"],
+                                   mask_channel=mask_channel)
+                self._loss._add_l2_regularization_term(swap_loss, 3)
+            self._loss.add_function_to_output("decoder_df_b_1", swap_loss)
+
+        if self._architecture == "df" and self._true_face_power > 0.0:
+            # TODO Mask shouldn't input here.
+            self._loss.add_function_to_output("discriminator_df", k_losses.binary_crossentropy)
+
+        if self._gan_power > 0.0:
+            # TODO Mask shouldn't input here
+            # GAN Takes 1 version with output of A>A and 1 with source tgt image
+            # TODO The loss function
+            self._loss.add_function_to_output("patch_discriminator", k_losses.mean_squared_error)
 
     def encoder(self):
         """ DFL SAEHD Encoder Network"""
@@ -216,21 +299,19 @@ class Model(ModelBase):
 
     def discriminator_df(self, input_shape):
         """ True Face Power Code Discriminator for DF Architecture. """
-        input_ = Input(shape=(input_shape))
+        input_ = Input(shape=input_shape)
         code_res = (self.input_shape[0] // (16 if self.config["res_double"] else 8))
-        print("code_res", code_res)
 
         var_x = input_
         for idx in range(1 + code_res // 8):
             filters = 256 * min(2**idx, 8)
             kernel_size = 4 if idx == 0 else 3
-            print(var_x, filters)
             var_x = Conv2DBlock(filters, kernel_size=kernel_size)(var_x)
         var_x = Conv2D(1, 1, padding="VALID")(var_x)
         return KerasModel(input_, var_x, name="discriminator_df")
 
 
-class UNetPatchDiscriminator():
+class UNetPatchDiscriminator():  # pylint:disable=too-few-public-methods
     def __init__(self, input_shape):
         self._input_shape = input_shape
         self._layers = self._get_layers()
@@ -287,7 +368,15 @@ class UNetPatchDiscriminator():
             target_size *= size
         return receptive_fields
 
-    def __call__(self):
+    def build(self):
+        """ Build the discriminator Model.
+
+        Returns
+        -------
+        :class:`keras.models.Model`
+            The built discriminator model
+        """
+
         input_ = Input(shape=self._input_shape)
         base_filters = 16
 
@@ -322,3 +411,45 @@ class UNetPatchDiscriminator():
 
         var_x = Conv2DBlock(1, kernel_size=1, padding="valid")(var_x)
         return KerasModel(input_, [center_out, var_x], name="patch_discriminator")
+
+
+class StyleLoss(keras.losses.Loss):  # pylint:disable=too-few-public-methods
+    """ Style Loss Function.
+
+    Parameters
+    ----------
+    loss_weight: float, optional
+        The weight to apply to the loss. Default: `1.0`
+    """
+    def __init__(self, loss_weight=1.0):
+        super().__init__(name="StyleLoss")
+        self.loss_weight = loss_weight
+
+    def call(self, y_true, y_pred):
+        """ Call the Style Loss Loss Function.
+
+        Parameters
+        ----------
+        y_true: tensor or variable
+            The ground truth value
+        y_pred: tensor or variable
+            The predicted value
+
+        Returns
+        -------
+        tensor
+            The Style Loss value
+        """
+        true_mean = K.mean(y_true, axis=[1, 2], keepdims=True)
+        true_var = K.var(y_true, axis=[1, 2], keepdims=True)
+        true_std = K.sqrt(true_var + 1e-5)
+
+        pred_mean = K.mean(y_pred, axis=[1, 2], keepdims=True)
+        pred_var = K.var(y_pred, axis=[1, 2], keepdims=True)
+        pred_std = K.sqrt(pred_var + 1e-5)
+
+        mean_loss = K.sum(K.square(true_mean - pred_mean), axis=[1, 2, 3])
+        std_loss = K.sum(K.square(true_std - pred_std), axis=[1, 2, 3])
+
+        retval = (mean_loss + std_loss) * (self.loss_weight / K.int_shape(y_true)[-1])
+        return retval

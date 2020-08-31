@@ -268,7 +268,8 @@ class ModelBase():
                 inputs = self._get_inputs()
                 self._model = self.build_model(inputs)
             if not self._is_predict:
-                self._compile_model()
+                optimizer = self._configure_options()
+                self._compile_model(optimizer)
             self._output_summary()
 
     def _update_legacy_models(self):
@@ -376,19 +377,32 @@ class ModelBase():
         of iterations completed appended to the end of the model name. """
         self._io._snapshot()  # pylint:disable=protected-access
 
-    def _compile_model(self):
-        """ Compile the model to include the Optimizer and Loss Function(s). """
-        logger.debug("Compiling Model")
+    def _configure_options(self):
+        """ Configure the options for the Optimizer and Loss Functions.
 
+        Returns the request optimizer, and sets the loss parameters in :attr:`_loss`.
+
+        Returns
+        :class:`keras.optimizers.Optimizer`
+            The request optimizer
+        """
+        logger.debug("Configuring Options")
         optimizer = _Optimizer(self.config["optimizer"],
                                self.config["learning_rate"],
                                self.config.get("clipnorm", False),
                                self._args).optimizer
+
         if self._settings.use_mixed_precision:
             optimizer = self._settings.LossScaleOptimizer(optimizer, loss_scale="dynamic")
         if get_backend() == "amd":
             self._rewrite_plaid_outputs()
         self._loss.configure(self._model)
+        logger.debug("Configured Options. Optimizer: %s", optimizer)
+        return optimizer
+
+    def _compile_model(self, optimizer):
+        """ Compile the model to include the Optimizer and Loss Function(s). """
+        logger.debug("Compiling Model")
         self._model.compile(optimizer=optimizer, loss=self._loss.functions)
         if not self._is_predict:
             self._state.add_session_loss_names(self._loss.names)
@@ -937,6 +951,12 @@ class _Loss():
             return None
         return [K.int_shape(mask_input) for mask_input in self._mask_inputs]
 
+    @property
+    def loss_function(self):
+        """:class:`keras.losses.Loss` that has been chosen by the user as the selected loss
+        function."""
+        return self._loss_dict[self._config["loss_function"]]
+
     def configure(self, model):
         """ Configure the loss functions for the given inputs and outputs.
 
@@ -994,20 +1014,19 @@ class _Loss():
             The output names from the model
         """
         mask_channels = self._get_mask_channels()
-        face_loss = self._loss_dict[self._config["loss_function"]]
 
         for name, output_name in zip(self._names, output_names):
             if name.startswith("mask"):
                 loss_func = self._loss_dict[self._config["mask_loss_function"]]
             else:
                 loss_func = losses.LossWrapper()
-                loss_func.add_loss(face_loss, mask_channel=mask_channels[0])
+                loss_func.add_loss(self.loss_function, mask_channel=mask_channels[0])
                 self._add_l2_regularization_term(loss_func, mask_channels[0])
 
                 mask_channel = 1
                 for multiplier in ("eye_multiplier", "mouth_multiplier"):
                     if self._config[multiplier] > 1:
-                        loss_func.add_loss(face_loss,
+                        loss_func.add_loss(self.loss_function,
                                            weight=self._config[multiplier] * 1.0,
                                            mask_channel=mask_channels[mask_channel])
                         self._add_l2_regularization_term(loss_func, mask_channel)
@@ -1029,7 +1048,7 @@ class _Loss():
             The channel that holds the mask in `y_true`, if a mask is used for the loss.
             `-1` if the input is not masked
         """
-        if self._config["loss_function"] in self._uses_l2_reg and self._config["l2_reg_term"] > 0:
+        if self.loss_function in self._uses_l2_reg and self._config["l2_reg_term"] > 0:
             logger.debug("Adding L2 Regularization for Structural Loss")
             loss_wrapper.add_loss(self._loss_dict["mse"],
                                   weight=self._config["l2_reg_term"] / 100.0,
@@ -1055,6 +1074,19 @@ class _Loss():
                 current_channel += 1
         logger.debug("uses_masks: %s, mask_channels: %s", uses_masks, mask_channels)
         return mask_channels
+
+    def add_function_to_output(self, output, function):
+        """ Add a loss function to the given output node.
+
+        If a loss function already exists on the given node then it will be replaced.
+
+        output: str
+            The Keras output name to apply the loss function to
+        function
+            :class:`keras.loss.Loss` Loss function for the output node
+        """
+        logger.debug("Adding loss function: %s to output: %s", function, output)
+        self._funcs[output] = function
 
 
 class State():
