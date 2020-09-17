@@ -360,6 +360,7 @@ class _Feeder():
         self._images = images
         self._config = config
         self._alignments = alignments
+        self._batch_size = batch_size
         self._target = dict()
         self._samples = dict()
         self._masks = dict()

@@ -53,7 +53,16 @@ class Trainer(TrainerBase):
         loss: list
             The loss values for a batch
         """
-        return self._model.model.train_on_batch(model_inputs, y=model_targets)
+        loss = self._model.model.train_on_batch(model_inputs, y=model_targets)
+        as_dict = {name: val for name, val in zip(self._model.model.output_names, loss)}
+        swap_loss = sum(loss[:2])
+        true_face = self._model._dfl_model.multipliers["true_face"]
+        if true_face > 0.0:
+            swap_loss += (true_face * as_dict["discriminator_df"])
+            tf_loss = as_dict["discriminator_df"]
+
+        print([(name, lss) for name, lss in zip(self._model.model.output_names, loss)])
+        return loss
 
 
 class Feeder(_Feeder):
@@ -88,11 +97,19 @@ class Feeder(_Feeder):
             The training data generator
         """
         logger.debug("Loading generator: %s", output_index)
-        input_size = K.int_shape(self._model._inputs["face"][output_index])[1]
-        outputs = self._model._outputs["face"][output_index]
-        outputs = outputs if isinstance(outputs, list) else [outputs]
-        output_shapes = [K.int_shape(out)[1:] for out in outputs]
+
+        face_input = [inp for inp in self._model.model.input
+                      if inp.name.startswith("face_in_{}".format("a" if output_index == 0
+                                                                 else "b"))][0]
+        input_size = K.int_shape(face_input)[1]
+
+        output_count = 2 if self._config["learn_mask"] else 1
+        start_idx = output_index * output_count
+        face_outputs = self._model.model.output[start_idx:start_idx + output_count]
+        output_shapes = [K.int_shape(out)[1:] for out in face_outputs]
+
         logger.debug("input_size: %s, output_shapes: %s", input_size, output_shapes)
+
         generator = TrainingDataGenerator(input_size,
                                           output_shapes,
                                           self._model.coverage_ratio,
@@ -145,5 +162,13 @@ class Feeder(_Feeder):
                 style_targets = np.concatenate((style_targets, 1.0 - b_mask), axis=-1)
             logger.trace("style_targets %s", style_targets.shape)
             model_targets["decoder_df_b_1"] = style_targets
+
+        if (self._model.config["architecture"].lower() == "df" and
+                self._model.config["true_face_power"] > 0.0):
+            out_shape = K.int_shape(self._model.model.get_layer("discriminator_df").output)[1:]
+            ones = np.ones((self._batch_size, ) + out_shape, dtype="float32")
+            zeros = np.ones((self._batch_size, ) + out_shape, dtype="float32")
+            model_targets["discriminator_df"] = ones
+            model_targets["discriminator_df_1"] = zeros
 
         return model_inputs, model_targets

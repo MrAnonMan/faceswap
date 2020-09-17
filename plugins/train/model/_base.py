@@ -396,14 +396,16 @@ class ModelBase():
             optimizer = self._settings.LossScaleOptimizer(optimizer, loss_scale="dynamic")
         if get_backend() == "amd":
             self._rewrite_plaid_outputs()
-        self._loss.configure(self._model)
+        self._loss.configure(self._model, self.config["learn_mask"])
         logger.debug("Configured Options. Optimizer: %s", optimizer)
         return optimizer
 
     def _compile_model(self, optimizer):
         """ Compile the model to include the Optimizer and Loss Function(s). """
         logger.debug("Compiling Model")
-        self._model.compile(optimizer=optimizer, loss=self._loss.functions)
+        self._model.compile(optimizer=optimizer,
+                            loss=self._loss.functions,
+                            loss_weights=self._loss.weights)
         if not self._is_predict:
             self._state.add_session_loss_names(self._loss.names)
         logger.debug("Compiled Model: %s", self._model)
@@ -919,6 +921,7 @@ class _Loss():
         self._inputs = None
         self._names = []
         self._funcs = dict()
+        self._weights = dict()
         logger.debug("Initialized: %s", self.__class__.__name__)
 
     @property
@@ -930,6 +933,11 @@ class _Loss():
     def functions(self):
         """ dict: The loss functions that apply to each model output. """
         return self._funcs
+
+    @property
+    def weights(self):
+        """ dict: The amount of weighting to apply to each output function. """
+        return self._weights
 
     @property
     def _config(self):
@@ -957,17 +965,22 @@ class _Loss():
         function."""
         return self._loss_dict[self._config["loss_function"]]
 
-    def configure(self, model):
-        """ Configure the loss functions for the given inputs and outputs.
+    def configure(self, model, learn_mask):
+        """ Configure the loss functions for the primary face inputs and outputs.
 
         Parameters
         ----------
         model: :class:`keras.models.Model`
             The model that is to be trained
+        learn_mask: bool
+            ``True`` if a mask is being learned otherwise ``False``
         """
-        self._inputs = model.inputs
-        self._set_loss_names(model.outputs)
-        self._set_loss_functions(model.output_names)
+        self._inputs = model.inputs[:2]
+        # TODO This likely will fail on dfl_sae multi-output
+        output_count = 4 if learn_mask else 2
+        self._set_loss_names(model.outputs[:output_count])
+        self._set_loss_functions(model.output_names[:output_count])
+        self._weights = {name: 1.0 for name in self._funcs}  # Default losses take default weight
         self._names.insert(0, "total")
 
     def _set_loss_names(self, outputs):
@@ -1075,7 +1088,7 @@ class _Loss():
         logger.debug("uses_masks: %s, mask_channels: %s", uses_masks, mask_channels)
         return mask_channels
 
-    def add_function_to_output(self, output, function):
+    def add_function_to_output(self, output, function, weight=1.0):
         """ Add a loss function to the given output node.
 
         If a loss function already exists on the given node then it will be replaced.
@@ -1084,9 +1097,13 @@ class _Loss():
             The Keras output name to apply the loss function to
         function
             :class:`keras.loss.Loss` Loss function for the output node
+        weight: float
+            The amount of weighting to apply to this loss function
         """
-        logger.debug("Adding loss function: %s to output: %s", function, output)
+        logger.debug("Adding loss function: %s to output: %s (weight: %s)",
+                     function, output, weight)
         self._funcs[output] = function
+        self._weights[output] = weight
 
 
 class State():
