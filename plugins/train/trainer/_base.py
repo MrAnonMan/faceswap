@@ -12,6 +12,8 @@ import logging
 import os
 import time
 
+from functools import partial
+
 import cv2
 import numpy as np
 
@@ -106,9 +108,10 @@ class TrainerBase():
             are required for training, `masks_eye` if eye masks are required and `masks_mouth` if
             mouth masks are required. """
         retval = dict()
+        penalized_loss = self._model.config["penalized_mask_loss"]
 
         if not any([self._model.config["learn_mask"],
-                    self._model.config["penalized_mask_loss"],
+                    penalized_loss,
                     self._model.config["eye_multiplier"] > 1,
                     self._model.config["mouth_multiplier"] > 1,
                     self._model.command_line_arguments.warp_to_landmarks]):
@@ -120,14 +123,14 @@ class TrainerBase():
             logger.debug("Adding landmarks to training opts dict")
             retval["landmarks"] = alignments.landmarks
 
-        if self._model.config["learn_mask"] or self._model.config["penalized_mask_loss"]:
+        if self._model.config["learn_mask"] or penalized_loss:
             logger.debug("Adding masks to training opts dict")
             retval["masks"] = alignments.masks
 
-        if self._model.config["eye_multiplier"] > 1:
+        if penalized_loss and self._model.config["eye_multiplier"] > 1:
             retval["masks_eye"] = alignments.masks_eye
 
-        if self._model.config["mouth_multiplier"] > 1:
+        if penalized_loss and self._model.config["mouth_multiplier"] > 1:
             retval["masks_mouth"] = alignments.masks_mouth
 
         logger.debug({key: {k: len(v) for k, v in val.items()} for key, val in retval.items()})
@@ -1065,16 +1068,14 @@ class _TrainingAlignments():
         self._hashes = self._get_image_hashes(image_list)
         self._detected_faces = self._load_alignments()
         self._check_all_faces()
+        self._landmarks = self._get_landmarks()
         logger.debug("Initialized %s", self.__class__.__name__)
 
     # Get landmarks
     @property
     def landmarks(self):
         """ dict: The :class:`numpy.ndarray` aligned landmarks for keys "a" and "b" """
-        retval = {side: self._transform_landmarks(side, detected_faces)
-                  for side, detected_faces in self._detected_faces.items()}
-        logger.trace(retval)
-        return retval
+        return self._landmarks
 
     def _get_alignments_paths(self):
         """ Obtain the alignments file paths from the command line arguments passed to the model.
@@ -1103,6 +1104,20 @@ class _TrainingAlignments():
                 raise FaceswapError("Alignments file does not exist: `{}`".format(alignments_path))
             retval[side] = alignments_path
         logger.debug("Alignments paths: %s", retval)
+        return retval
+
+    def _get_landmarks(self):
+        """ Pre-generate landmarks as they are needed for both warp to landmarks and eye/mouth
+        masks.
+
+        Returns
+        -------
+        dict
+            The :class:`numpy.ndarray` aligned landmarks for keys "a" and "b"
+        """
+        retval = {side: self._transform_landmarks(side, detected_faces)
+                  for side, detected_faces in self._detected_faces.items()}
+        logger.trace(retval)
         return retval
 
     def _transform_landmarks(self, side, detected_faces):
@@ -1198,12 +1213,13 @@ class _TrainingAlignments():
         logger.trace("side: %s, detected_faces: %s, area: %s", side, detected_faces, area)
         masks = dict()
         for fhash, face in detected_faces.items():
-            mask = face.get_landmark_mask(self._training_size,
-                                          area,
-                                          aligned=True,
-                                          dilation=self._training_size // 32,
-                                          blur_kernel=self._training_size // 16,
-                                          as_zip=True)
+            mask = partial(face.get_landmark_mask,
+                           self._training_size,
+                           area,
+                           aligned=True,
+                           dilation=self._training_size // 32,
+                           blur_kernel=self._training_size // 16,
+                           as_zip=True)
             for filename in self._hash_to_filenames(side, fhash):
                 masks[filename] = mask
         logger.trace("side: %s, area: %s, masks: %s",

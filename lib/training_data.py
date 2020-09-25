@@ -3,6 +3,7 @@
 
 import logging
 
+from functools import partial
 from random import shuffle, choice
 from zlib import decompress
 
@@ -239,9 +240,12 @@ class TrainingDataGenerator():  # pylint:disable=too-few-public-methods
         processed.update(self._processing.get_targets(batch))
 
         # Random Warp # TODO change masks to have a input mask and a warped target mask
-        processed["feed"] = [self._processing.warp(batch[..., :3],
-                                                   self._warp_to_landmarks,
-                                                   **warp_kwargs)]
+        if not self._config["disable_warp"]:
+            processed["feed"] = [self._processing.warp(batch[..., :3],
+                                                       self._warp_to_landmarks,
+                                                       **warp_kwargs)]
+        else:
+            processed["feed"] = [self._processing.skip_warp(batch[..., :3])]
 
         logger.trace("Processed batch: (filenames: %s, side: '%s', processed: %s)",
                      filenames,
@@ -277,19 +281,50 @@ class TrainingDataGenerator():  # pylint:disable=too-few-public-methods
             item = self._masks[key]
             if item is None and key != "masks":
                 continue
+
+            # Expand out partials for eye and mouth masks on first epoch
+            if item is not None and key in ("eyes", "mouths"):
+                self._expand_partials(side, item, filenames)
+
             if item is None and key == "masks":
                 logger.trace("Creating dummy masks. side: %s", side)
                 masks = np.ones_like(batch[..., :1], dtype=batch.dtype)
             else:
                 logger.trace("Obtaining masks for batch. (key: %s side: %s)", key, side)
                 masks = np.array([self._get_mask(item[side][filename], size)
-                                  for filename, face in zip(filenames, batch)], dtype=batch.dtype)
+                                  for filename in filenames], dtype=batch.dtype)
                 masks = self._resize_masks(size, masks)
 
             logger.trace("masks: (key: %s, shape: %s)", key, masks.shape)
             batch = np.concatenate((batch, masks), axis=-1)
         logger.trace("Output batch shape: %s, side: %s", batch.shape, side)
         return batch
+
+    @classmethod
+    def _expand_partials(cls, side, item, filenames):
+        """ Expand partials to their compressed byte masks and replace into the main item
+        dictionary.
+
+        This is run once for each mask on the first epoch, to save on start up time.
+
+        Parameters
+        ----------
+        item: dict
+            The mask objects with filenames for the current mask type and side
+        filenames: list
+            A list of filenames that are being processed this batch
+        """
+        to_process = {filename: item[side][filename] for filename in filenames}
+        if not any(isinstance(ptl, partial) for ptl in to_process.values()):
+            return
+
+        for filename, ptl in to_process.items():
+            if not isinstance(ptl, partial):
+                logger.debug("Mask already generated. side: '%s', filename: '%s'",
+                             side, filename)
+                continue
+            logger.debug("Generating mask. side: '%s', filename: '%s'", side, filename)
+            item[side][filename] = ptl()
 
     @classmethod
     def _get_mask(cls, item, size):
@@ -808,3 +843,27 @@ class ImageAugmentation():
                                  for image in warped_batch])
         logger.trace("Warped batch shape: %s", warped_batch.shape)
         return warped_batch
+
+    def skip_warp(self, batch):
+        """ Returns the images resized and cropped for feeding the model, if warping has been
+        disabled.
+
+        Parameters
+        ----------
+        batch: :class:`numpy.ndarray`
+            The batch should be a 4-dimensional array of shape (`batchsize`, `height`, `width`,
+            `3`) and in `BGR` format.
+
+        Returns
+        -------
+        :class:`numpy.ndarray`
+            The given batch cropped and resized for feeding the model
+        """
+        logger.trace("Compiling skip warp images: batch shape: %s", batch.shape)
+        slices = self._constants["tgt_slices"]
+        retval = np.array([cv2.resize(image[slices, slices, :],
+                                      (self._input_size, self._input_size),
+                                      cv2.INTER_AREA)
+                           for image in batch], dtype='float32') / 255.
+        logger.trace("feed batch shape: %s", retval.shape)
+        return retval
