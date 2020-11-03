@@ -14,7 +14,7 @@ from keras.layers import Conv2DTranspose, Dense, Flatten, Input, LeakyReLU, Resh
 from lib.model.layers import DenseNorm
 from lib.model.nn_blocks import (Concatenate, Conv2D, Conv2DBlock, Conv2DOutput, UpscaleBlock,
                                  ResidualBlock)
-from ._base import ModelBase, KerasModel, losses, logger, k_losses
+from ._base import ModelBase, KerasModel, losses, logger, k_losses, _Optimizer
 
 
 # TODO Add note to use RMS Prop for stock settings
@@ -39,7 +39,8 @@ class Model(ModelBase):
                                     self.config,
                                     self._round_up(self.config["encoder_dims"]),
                                     self._round_up(self.config["decoder_dims"]),
-                                    self.name)
+                                    self.name,
+                                    self._args)
 
     @classmethod
     def _round_up(cls, value, factor=2):
@@ -86,21 +87,29 @@ class Model(ModelBase):
         :class:`keras.optimizers.Optimizer`
             The request optimizer
         """
-        if self._dfl_model.models["full"] is None:
+        if self._dfl_model.models["full"] is None:  # Use saved model if not defining new model
             self._dfl_model.models["full"] = self._model
+
+        # Substitute in the base training model from the saved full model file
         self._dfl_model.build_training_model()
+        self._dfl_model.build_additional_models()
         self._model = self._dfl_model.models["training"]
 
         optimizer = super()._configure_options()
-        self._set_additional_loss()
+        self._set_style_powers()  # Add face/bg style power losses
 
         return optimizer
 
-    def _set_additional_loss(self):
-        """ Set the additional loss functions for extra outputs.
+    def _compile_model(self, optimizer):
+        """ Override main method to compile the initial training model, then any additional
+        required models. """
+        super()._compile_model(optimizer)
+        logger.debug("Compiling Additional Models")
+        self._dfl_model.build_additional_models()
+        logger.debug("Compiled Model: %s", self._model)
 
-        Adds style power loses, True Face (df architecture only) and GAN
-        loss to their appropriate outputs
+    def _set_style_powers(self):
+        """ Set the additional loss functions for the swapped model style losses.
         """
         # TODO Check the impact "learn_mask" has on all of this
         output_idx = 4 if self.config["learn_mask"] else 2
@@ -108,6 +117,9 @@ class Model(ModelBase):
             self._add_style_loss(output_idx)
             output_idx += 1
 
+    def _set_additional_losses(self):
+        """ Set losses for the GAN(s) """
+    
         if (self.config["architecture"].lower() == "df" and
                 self._dfl_model.multipliers["true_face"] > 0.0):
             output_idx += self._add_true_face_loss(output_idx)
@@ -159,13 +171,15 @@ class Model(ModelBase):
         return output_index
 
 class _DFLSAEHD():
-    def __init__(self, input_shape, config, encoder_dims, decoder_dims, name):
+    def __init__(self, input_shape, config, encoder_dims, decoder_dims, name, args):
         self._input_shape = input_shape
 
         self._architecture = config["architecture"].lower()
         self._res_double = config["res_double"]
         self._dense_norm = config["dense_norm"]
         self._use_mask = config["learn_mask"]
+        self._config = config
+        self._args = args
         self._name = name
 
         self.multipliers = dict(gan=config["gan_power"] / 100.0,
@@ -201,9 +215,13 @@ class _DFLSAEHD():
         inputs.append(gan_input)
 
         gan = UNetPatchDiscriminator(output_shape).build()
+        print(gan)
+        print(outputs)
+        print("\n======")
+
         gan_gen = gan(outputs[0])
         gan_dis = gan(gan_input)
-        outputs.extend([gan_gen, gan_dis])
+        outputs.extend(gan_gen + gan_dis)
 
         autoencoder = KerasModel(inputs,
                                  outputs,
@@ -213,7 +231,8 @@ class _DFLSAEHD():
     def _build_(self, inputs):
         """ Build the full DFL-SAEHD Model regardless of configured options
 
-        Override to bu all sub-models in the model, regardless if they have been selected for use.
+        Override to build all sub-models in the model, regardless if they have been selected for
+        use.
 
         Parameters
         ----------
@@ -236,24 +255,59 @@ class _DFLSAEHD():
         """
         inputs = self.models["full"].input[:4 if self._use_mask else 2]
         logger.debug("Training inputs: %s", inputs)
+
         # TODO Multiscale outputs
-        
         outputs = [lyr for lyr, name in zip(self.models["full"].output,
                                             self.models["full"].output_names)
                    if name.startswith("decoder")]
+        
         if self.multipliers["face_style"] == 0.0 and self.multipliers["bg_style"] == 0.0:
             # TODO Remove the last decoder output as this is the swap model output. Need to
             # check counts with learn mask attribute
             outputs.pop(2)
+        
+        inputs, outputs = self._add_architecture_specific_models(inputs, outputs)
+        
+        if self.multipliers["gan"] > 0.0:
+            inputs, outputs = self._add_gan(inputs, outputs)
+
         logger.debug("Training outputs: %s", outputs)
         self.models["training"] = KerasModel(inputs,
                                              outputs,
                                              name="{}_training".format(self._name))
-    
-        if self._architecture == "df" and self.multipliers["true_face"] > 0.0:
-            true_face inputs = 
+        print(self.models["training"].summary())
+        exit(0)
 
-        return outputs
+    def _add_gan(self, inputs, outputs):
+        """ Add any additionally selected Discriminator models to the training models. """
+        discrim = next(layer for layer in self.models["full"].layers
+                       if layer.name == "patch_discriminator")
+        gan_optimizer = _Optimizer(self._config["optimizer"],
+                                   self._config["learning_rate"],
+                                   self._config.get("clipnorm", False),
+                                   self._args).optimizer
+        discrim.compile(loss="binary_crossentropy", optimizer=gan_optimizer, metrics=["accuracy"])
+
+        input_discrim = next(layer
+                             for layer
+                             in self.models["full"].input
+                             if layer.name.startswith("gan_discrim"))
+        gan_discrim = discrim(input_discrim)
+        inputs.append(input_discrim)
+        outputs.extend(gan_discrim)
+
+        discrim.trainable = False
+
+        input_gen = next(layer for layer in self.models["full"].output
+                         if layer.name.startswith("decoder_df_a"))
+        gan_gen = discrim(input_gen)
+        outputs.append(gan_gen)
+
+        return inputs, outputs
+
+    def _add_architecture_specific_models(self, inputs, outputs):
+        """ Override to build training models that are specific for the current architecture. """
+        return inputs, outputs
 
     def encoder(self):
         """ DFL SAEHD Encoder Network"""
@@ -357,6 +411,7 @@ class _ModelDF(_DFLSAEHD):
         inter = self.inter(encoder.output_shape[1:])
 
         inter_out_shape = inter.output_shape[1:]
+
         decoder_a = self.decoder(inter_out_shape, side="a")
         decoder_b = self.decoder(inter_out_shape, side="b")
 
@@ -373,6 +428,106 @@ class _ModelDF(_DFLSAEHD):
                    true_face(inter_a),  # TrueFace(A)
                    true_face(inter_b)]  # TrueFace(B)
         return outputs
+
+    def _add_architecture_specific_models(self, inputs, outputs):
+        """ Override to build training models that are specific for the current architecture. """
+        if self.multipliers["gan"] <= 0.0:
+            return inputs, outputs
+
+        discrim = next(layer for layer in self.models["full"].layers
+                       if layer.name == "discriminator_df")
+        gan_optimizer = _Optimizer(self._config["optimizer"],
+                                   self._config["learning_rate"],
+                                   self._config.get("clipnorm", False),
+                                   self._args).optimizer
+        discrim.compile(loss="binary_crossentropy", optimizer=gan_optimizer, metrics=["accuracy"])
+        print([layer.name for layer in self.models["full"].layers])
+        test = next(layer for layer in self.models["full"].layers if layer.name == "inter_df")
+        print(test)
+        print(test.output)
+        exit(0)
+
+        input_discrim = next(layer
+                             for layer
+                             in self.models["full"].input
+                             if layer.name.startswith("gan_discrim"))
+        gan_discrim = discrim(input_discrim)
+        inputs.append(input_discrim)
+        outputs.extend(gan_discrim)
+
+        discrim.trainable = False
+
+        input_gen = next(layer for layer in self.models["full"].output
+                         if layer.name.startswith("decoder_df_a"))
+        gan_gen = discrim(input_gen)
+        outputs.append(gan_gen)
+
+        return inputs, outputs
+
+
+    def build_additional_models(self):
+        """ Add the True Face model to the training models if it has been selected. """
+        super().build_additional_models()
+        if self.multipliers["true_face"] <= 0.0:
+            return
+        tf_model = next(layer
+                        for layer in self.models["full"].layers
+                        if layer.name == "discriminator_df")
+        tf_inputs = next(layer.output
+                         for layer in self.models["training"].layers
+                         if layer.name == "inter_df")
+        tf_outputs = [layer.name
+                      for layer in self.models["full"].output
+                      if layer.name.startswith("discriminator_df")]
+        inter = next(layer
+                     for layer in self.models["training"].layers
+                     if layer.name == "inter_df")
+        print([lyr.name for lyr in self.models["full"].layers])
+        print(inter)
+        print(inter.output_shape)
+
+
+        model = tf_model(tf_inputs)
+        print(self.models["training"])
+        outputs = [layer
+                   for layer in self.models["training"].layers
+                   if layer.name.startswith("decoder_df")]
+        inters = [layer.inbound_nodes[0]
+                   for layer in self.models["training"].layers
+                   if layer.name.startswith("decoder_df")]
+        print(outputs)
+        print(dir(outputs[0]))
+        print([out.inbound_nodes for out in outputs])
+        exit(0)
+
+        print(inters)
+        print([(i.input_tensors, i.inbound_layers) for i in inters])
+        print(dir(inters[0]))
+        print(self.models["training"].summary())
+        exit(0)
+        print(model)
+
+        print("---------")
+        print(tf_inputs)
+        print(tf_outputs)
+        print("---------")
+        print(tf_model.input, tf_model.output)
+        print([(layer["name"], layer["inbound_nodes"])
+                for layer in self.models["training"].get_config()["layers"]
+                if layer["name"] == "inter_df"])
+        outputs = [lyr for lyr, name in zip(self.models["training"].output,
+                                            self.models["training"].output_names)
+                   if name.startswith("decoder")]
+        print(outputs)
+        
+#        ones = K.ones_like(outputs[0])
+#        zeros = K.zeros_like(outputs[0])
+#        print(outputs, ones, zeros)
+        exit(0)
+        # a_discrim = 
+        
+
+            
 
     def discriminator_df(self, input_shape):
         """ True Face Power Code Discriminator for DF Architecture. """
